@@ -1,0 +1,287 @@
+import os
+import time
+import smtplib
+from email.mime.text import MIMEText
+import json
+import logging
+from datetime import datetime
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+
+# Configuración de logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def setup_config():
+    """Configurar manualmente la lista de productos, login y email."""
+    config = {
+        "products": [],
+        "email": {"enabled": False},
+        "popmart_credentials": {"email": "", "password": ""},
+        "check_interval": 300,
+        "login_required": False
+    }
+    print("⚙️ CONFIGURACIÓN DE POPMART SELENIUM MONITOR")
+    print("=" * 50)
+    # Productos
+    while True:
+        name = input("Nombre del producto: ")
+        url = input("URL del producto: ")
+        tp = input("Precio objetivo (Enter sin límite): ").strip()
+        target_price = float(tp) if tp else float('inf')
+        auto = input("¿Auto agregar al carrito? (s/n): ").lower().startswith('s')
+        config["products"].append({
+            "name": name,
+            "url": url,
+            "target_price": target_price,
+            "auto_add_to_cart": auto
+        })
+        if not input("Agregar otro producto? (s/n): ").lower().startswith('s'):
+            break
+    # Login
+    if input("Requiere login PopMart? (s/n): ").lower().startswith('s'):
+        config["login_required"] = True
+        config["popmart_credentials"]["email"] = input("Email PopMart: ")
+        config["popmart_credentials"]["password"] = input("Password PopMart: ")
+    # Email
+    if input("Configurar alertas por email? (s/n): ").lower().startswith('s'):
+        config["email"] = {
+            "enabled": True,
+            "smtp_server": "smtp.gmail.com",
+            "smtp_port": 587,
+            "from_email": input("Tu email: "),
+            "from_password": input("App password: "),
+            "to_email": input("Email destino (Enter mismo): ") or None
+        }
+        if not config["email"]["to_email"]:
+            config["email"]["to_email"] = config["email"]["from_email"]
+    # Intervalo
+    iv = input("Intervalo en minutos (por defecto 5): ")
+    config["check_interval"] = int(iv or 5) * 60
+    # Guardar config
+    with open('popmart_selenium_config.json', 'w') as f:
+        json.dump(config, f, indent=2)
+    print("✅ Configuración guardada")
+    return config
+
+class PopMartSeleniumMonitor:
+    def __init__(self, config=None):
+        if config:
+            self.config = config
+        elif os.path.exists('popmart_selenium_config.json'):
+            with open('popmart_selenium_config.json') as f:
+                self.config = json.load(f)
+        else:
+            self.config = setup_config()
+        self.driver = None
+        self.wait = None
+
+    def setup_driver(self):
+        logger.info("🚀 Configurando Chrome driver...")
+        options = Options()
+        # options.add_argument("--headless")  # descomenta para ocultar navegador
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option('useAutomationExtension', False)
+        options.binary_location = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        options.add_argument(
+            "user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.7151.119 Safari/537.36"
+        )
+        driver_path = ChromeDriverManager().install()
+        logger.info(f"🔍 Chromedriver: {driver_path}")
+        self.driver = webdriver.Chrome(service=Service(driver_path), options=options)
+        # Anti-detección
+        self.driver.execute_cdp_cmd(
+            'Page.addScriptToEvaluateOnNewDocument',
+            {'source': "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"}
+        )
+        self.wait = WebDriverWait(self.driver, 20)
+        logger.info("✅ Driver listo")
+
+    def login_to_popmart(self):
+        if not self.config.get('login_required'):
+            logger.info("🔓 Sin login requerido")
+            return True
+        logger.info("🔐 Login en PopMart...")
+        try:
+            self.driver.get("https://www.popmart.com/us/user/login?redirect=/account")
+            time.sleep(2)
+            # Cerrar posible modal de ubicación
+            try:
+                loc_btn = self.wait.until(EC.element_to_be_clickable(
+                    (By.XPATH, "//button[normalize-space()='United States']")))
+                loc_btn.click()
+                logger.info("🌐 Modal ubicación cerrado")
+                time.sleep(1)
+            except:
+                pass
+            # Desactivar overlay
+            self.driver.execute_script(
+                "const o=document.querySelector('.index_contentContainer__YSS2J'); if(o)o.style.pointerEvents='none';"
+            )
+            # Email
+            email_el = self.wait.until(EC.presence_of_element_located((By.ID, 'email')))
+            email_el.clear()
+            email_el.send_keys(self.config['popmart_credentials']['email'])
+            btn = self.wait.until(EC.element_to_be_clickable(
+                (By.XPATH, "//button[normalize-space()='CONTINUE']")))
+            self.driver.execute_script("arguments[0].click();", btn)
+            # Password
+            pwd_el = self.wait.until(EC.presence_of_element_located((By.ID, 'password')))
+            pwd_el.clear()
+            pwd_el.send_keys(self.config['popmart_credentials']['password'])
+            btn2 = self.wait.until(EC.element_to_be_clickable(
+                (By.XPATH, "//button[normalize-space()='SIGN IN']")))
+            self.driver.execute_script("arguments[0].click();", btn2)
+            time.sleep(3)
+            logger.info("✅ Login OK")
+            return True
+        except Exception as e:
+            screenshot = f"error_login_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+            if self.driver:
+                self.driver.save_screenshot(screenshot)
+            logger.error(f"❌ Login error: {e}. Screenshot: {screenshot}")
+            return False
+
+    def extract_price(self):
+        selectors = ['[class*="price"]', '.price', '[data-price]', '.cost', '.amount']
+        for sel in selectors:
+            try:
+                elems = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                for el in elems:
+                    txt = el.text.strip()
+                    if '$' in txt:
+                        import re
+                        m = re.search(r'\$(\d+(?:\.\d{2})?)', txt)
+                        if m:
+                            price = float(m.group(1))
+                            logger.info(f"💰 Precio {price}")
+                            return price
+            except:
+                continue
+        logger.warning("⚠️ Precio no encontrado")
+        return None
+
+    def check_stock_selenium(self):
+        xpaths = [
+            "//div[contains(., 'ADD TO BAG')]",
+            "//button[contains(., 'ADD TO BAG')]",
+            "//button[contains(., 'ADD TO CART')]",
+            "//*[contains(text(), 'ADD TO BAG')]"
+        ]
+        for xp in xpaths:
+            try:
+                btn = self.driver.find_element(By.XPATH, xp)
+                if btn.is_displayed() and btn.is_enabled():
+                    logger.info("✅ EN STOCK")
+                    return True
+            except:
+                continue
+        sold_out = ["//*[contains(text(), 'OUT OF STOCK')]", "//*[contains(text(), 'SOLD OUT')]", "//*[contains(text(), 'COMING SOON')]" ]
+        for xp in sold_out:
+            try:
+                el = self.driver.find_element(By.XPATH, xp)
+                if el.is_displayed():
+                    logger.info("❌ SIN STOCK")
+                    return False
+            except:
+                continue
+        logger.info("⚠️ Asumo SIN STOCK")
+        return False
+
+    def check_product_stock(self, url):
+        logger.info(f"🌐 Vérifying {url}")
+        try:
+            self.driver.get(url)
+            time.sleep(2)
+            price = self.extract_price()
+            in_stock = self.check_stock_selenium()
+            return {'price': price, 'in_stock': in_stock, 'timestamp': datetime.now().isoformat()}
+        except Exception as e:
+            logger.error(f"❌ Error check_stock: {e}")
+            return None
+
+    def add_to_cart_if_in_stock(self, url):
+        logger.info(f"🛒 Agregar al carrito {url}")
+        try:
+            self.driver.get(url)
+            time.sleep(2)
+            btn = self.driver.find_element(By.XPATH, "//div[contains(., 'ADD TO BAG')]")
+            self.driver.execute_script("arguments[0].scrollIntoView();", btn)
+            btn.click()
+            logger.info("🛒 Agregado al carrito")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Error al agregar al carrito: {e}")
+            return False
+
+    def send_alert(self, name, price, url, added):
+        if not self.config['email'].get('enabled'):
+            return
+        subject = f"🎉 {name} - {'Agregado' if added else 'En Stock'}"
+        body = f"Producto: {name}\nPrecio: {price}\nURL: {url}\n"
+        msg = MIMEText(body)
+        msg['Subject'] = subject
+        msg['From'] = self.config['email']['from_email']
+        msg['To'] = self.config['email']['to_email']
+        try:
+            server = smtplib.SMTP(self.config['email']['smtp_server'], self.config['email']['smtp_port'])
+            server.starttls()
+            server.login(self.config['email']['from_email'], self.config['email']['from_password'])
+            server.send_message(msg)
+            server.quit()
+            logger.info("📧 Alerta enviada")
+        except Exception as e:
+            logger.error(f"❌ Error enviando email: {e}")
+
+    def monitor_products(self):
+        self.setup_driver()
+        if self.config.get('login_required') and not self.login_to_popmart():
+            logger.error("Abortando por fallo de login")
+            self.driver.quit()
+            return
+        for p in self.config['products']:
+            info = self.check_product_stock(p['url'])
+            if info and info['in_stock']:
+                added = False
+                if p.get('auto_add_to_cart'):
+                    added = self.add_to_cart_if_in_stock(p['url'])
+                self.send_alert(p['name'], info['price'], p['url'], added)
+            time.sleep(1)
+        self.driver.quit()
+
+    def run_continuous(self):
+        interval = self.config.get('check_interval', 300)
+        try:
+            while True:
+                logger.info(f"🔄 Siguiente en {interval//60}m")
+                self.monitor_products()
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            logger.info("🛑 Monitoreo detenido por usuario")
+
+if __name__ == '__main__':
+    # Cargar o crear configuración\   
+    cfg = None
+    if not os.path.exists('popmart_selenium_config.json'):
+        cfg = setup_config()
+    monitor = PopMartSeleniumMonitor(cfg)
+    print("1-Run once  2-Continuous  3-Reconfig")
+    choice = input("Option: ")
+    if choice == '1':
+        monitor.monitor_products()
+    elif choice == '2':
+        monitor.run_continuous()
+    elif choice == '3':
+        cfg = setup_config()
+        monitor = PopMartSeleniumMonitor(cfg)
+        monitor.monitor_products()
